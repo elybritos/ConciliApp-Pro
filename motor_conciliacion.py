@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 motor_conciliacion.py
+
 Motor de conciliacion bancaria generico.
 Mejorado para archivos reales con encabezados en cualquier fila,
-metadata, columnas desplazadas y formatos argentinos.
+columnas vacias, metadata, multiples paginas, etc.
 """
 
 import re
@@ -12,6 +13,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 
+# ── Palabras clave para detectar encabezados ──────────────────────────────
 PALABRAS_CLAVE_FECHA = ['fecha', 'date', 'fch', 'dia', 'periodo', 'vencimiento', 'vto']
 PALABRAS_CLAVE_IMPORTE = ['importe', 'monto', 'debe', 'haber', 'valor', 'amount',
                          'total', 'neto', 'bruto', 'subtotal', 'credito', 'debito',
@@ -26,66 +28,139 @@ PALABRAS_CLAVE_CUIT = ['cuit', 'cuil', 'dni', 'documento', 'identificacion', 'id
 TODAS_PALABRAS_CLAVE = (PALABRAS_CLAVE_FECHA + PALABRAS_CLAVE_IMPORTE +
                         PALABRAS_CLAVE_CONCEPTO + PALABRAS_CLAVE_CUIT)
 
-METADATA_PATTERNS = [
-    r'^pagina\s*\d+', r'^página\s*\d+', r'^page\s*\d+',
-    r'^total\s*:', r'^empresa\s*:', r'^operador\s*:', r'^usuario\s*:',
-    r'^fecha\s*:', r'^hora\s*:', r'^sucursal\s*:', r'^\d+\s*de\s*\d+$',
-    r'^imprimir$', r'^exportar$', r'^reporte$', r'^listado$'
+# ── Patrones para detectar filas de metadata ─────────────────────────────
+PATRONES_METADATA = [
+    r'^fecha de descarga', r'^empresa:', r'^operador:', r'^filtrado por:',
+    r'^página \d+ de \d+', r'^total:', r'^listado de', r'^hc latinoamerica',
+    r'^desde\s+\d', r'^hasta\s+\d', r'^sucursal:', r'^cobrador:',
+    r'^cliente:', r'^\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2}$',
 ]
 
-def _es_metadata(fila):
-    texto = ' '.join([str(x).strip().lower() for x in fila if pd.notna(x)])
-    for patron in METADATA_PATTERNS:
-        if re.search(patron, texto):
-            return True
-    return False
 
 def normalizar_texto(t):
     if pd.isna(t): return ''
     t = re.sub(r'[.,]', ' ', str(t))
     return re.sub(r'\s+', ' ', t).strip().upper()
 
+
 def normalizar_importe(val):
+    """Normaliza un importe a float."""
     if pd.isna(val): return 0.0
-    s = str(val).replace('$', '').replace(' ', '').replace('\xa0', '')
-    if ',' in s and '.' in s:
-        if s.rfind(',') > s.rfind('.'):
-            s = s.replace('.', '').replace(',', '.')
-        else:
-            s = s.replace(',', '')
-    elif ',' in s:
-        partes = s.split(',')
-        if len(partes) == 2 and len(partes[1]) == 2 and len(partes[0]) > 0:
-            s = s.replace(',', '.')
-        else:
-            s = s.replace(',', '')
+
+    s = str(val).strip()
+    negativo = False
+    if s.startswith('(') and s.endswith(')'):
+        negativo = True
+        s = s[1:-1]
+
+    s = re.sub(r'[$€£\s]', '', s)
+
+    if not s:
+        return 0.0
+
+    num_commas = s.count(',')
+    num_dots = s.count('.')
+
+    if num_dots >= 1 and num_commas == 1 and s.rfind(',') > s.rfind('.'):
+        s = s.replace('.', '').replace(',', '.')
+    elif num_commas >= 1 and num_dots == 1 and s.rfind('.') > s.rfind(','):
+        s = s.replace(',', '')
+    elif num_commas == 1 and num_dots == 0:
+        s = s.replace(',', '.')
+    elif num_dots >= 2 and num_commas == 0:
+        s = s.replace('.', '')
+
     try:
-        return float(s)
+        resultado = float(s)
+        return -resultado if negativo else resultado
     except:
         return 0.0
 
+
 def normalizar_fecha(val):
+    """Intenta parsear fechas. Maneja numeros de serie de Excel y texto."""
     if pd.isna(val): return pd.NaT
+
     if isinstance(val, (datetime, pd.Timestamp)):
         return pd.Timestamp(val)
-    if isinstance(val, (int, float)) and val > 30000 and val < 50000:
+
+    # Si es un numero (serie de Excel)
+    if isinstance(val, (int, float)) and val > 30000:
         try:
             return pd.Timestamp('1899-12-30') + pd.Timedelta(days=int(val))
         except:
             pass
+
     s = str(val).strip()
-    for fmt in ['%d/%m/%Y', '%d-%m-%Y', '%d/%m/%y', '%d-%m-%y',
-                '%Y/%m/%d', '%Y-%m-%d', '%m/%d/%Y', '%d%m%Y']:
+    if not s or s.lower() in ['nan', 'nat', 'none', '']:
+        return pd.NaT
+
+    # Intentar como numero en string
+    try:
+        num = float(s)
+        if num > 30000:
+            return pd.Timestamp('1899-12-30') + pd.Timedelta(days=int(num))
+    except:
+        pass
+
+    formatos = [
+        '%d/%m/%Y', '%d-%m-%Y', '%d/%m/%y', '%d-%m-%y',
+        '%Y/%m/%d', '%Y-%m-%d', '%m/%d/%Y',
+        '%d.%m.%Y', '%d.%m.%y',
+    ]
+
+    for fmt in formatos:
         try:
             return pd.Timestamp(datetime.strptime(s, fmt))
         except ValueError:
             continue
+
     try:
         return pd.to_datetime(val, dayfirst=True, errors='coerce')
     except:
         return pd.NaT
 
+
+def _es_fila_metadata(fila):
+    """Detecta si una fila es metadata (no datos)."""
+    texto_completo = ' '.join([str(c).strip() for c in fila if pd.notna(c)]).lower()
+    for patron in PATRONES_METADATA:
+        if re.search(patron, texto_completo):
+            return True
+    return False
+
+
+def _es_excel(bytes_data):
+    """Detecta si los bytes corresponden a un archivo Excel."""
+    return bytes_data[:4] == b'PK\x03\x04' or bytes_data[:4] == b'\xd0\xcf\x11\xe0'
+
+
+def _leer_como_excel(bytes_data, header, nrows=None):
+    kwargs = {'header': header}
+    if nrows is not None:
+        kwargs['nrows'] = nrows
+    try:
+        return pd.read_excel(io.BytesIO(bytes_data), **kwargs)
+    except Exception:
+        return pd.read_excel(io.BytesIO(bytes_data), engine='xlrd', **kwargs)
+
+
+def _leer_como_csv(bytes_data, header, nrows=None):
+    kwargs = {'sep': None, 'engine': 'python', 'header': header}
+    if nrows is not None:
+        kwargs['nrows'] = nrows
+
+    for encoding in ['utf-8', 'latin1', 'iso-8859-1', 'cp1252']:
+        try:
+            kwargs['encoding'] = encoding
+            return pd.read_csv(io.BytesIO(bytes_data), **kwargs)
+        except Exception:
+            continue
+    raise ValueError("No se pudo leer el archivo como CSV.")
+
+
 def _puntaje_fila_encabezado(fila):
+    """Calcula un puntaje para una fila candidata a ser encabezado."""
     puntaje = 0
     celdas_no_vacias = 0
     for celda in fila:
@@ -106,68 +181,133 @@ def _puntaje_fila_encabezado(fila):
         puntaje = 0
     return puntaje
 
-def _es_excel(bytes_data):
-    header = bytes_data[:8]
-    if header[:2] == b'PK':
-        return True
-    if header[:4] == b'\xd0\xcf\x11\xe0':
-        return True
-    return False
-
-def _leer_como_excel(bytes_data, header=None, nrows=None):
-    try:
-        return pd.read_excel(io.BytesIO(bytes_data), header=header, nrows=nrows, engine='openpyxl')
-    except Exception:
-        try:
-            return pd.read_excel(io.BytesIO(bytes_data), header=header, nrows=nrows, engine='xlrd')
-        except Exception:
-            return pd.read_excel(io.BytesIO(bytes_data), header=header, nrows=nrows)
-
-def _leer_como_csv(bytes_data, header=None, nrows=None):
-    for encoding in ['utf-8', 'latin1', 'cp1252']:
-        for sep in [None, ';', ',', '\t']:
-            try:
-                return pd.read_csv(
-                    io.BytesIO(bytes_data),
-                    sep=sep,
-                    engine='python',
-                    header=header,
-                    nrows=nrows,
-                    encoding=encoding,
-                    on_bad_lines='skip'
-                )
-            except Exception:
-                continue
-    raise ValueError("No se pudo leer el archivo como CSV")
 
 def detectar_fila_encabezado(bytes_data, max_filas=20):
-    if _es_excel(bytes_data):
+    """Detecta la fila de encabezados. Retorna (fila_encabezado, df_raw)."""
+    es_excel = _es_excel(bytes_data)
+
+    if es_excel:
         df_raw = _leer_como_excel(bytes_data, header=None, nrows=max_filas)
     else:
         df_raw = _leer_como_csv(bytes_data, header=None, nrows=max_filas)
+
     mejor_fila = 0
     mejor_puntaje = -1
+
     for idx in range(min(max_filas, len(df_raw))):
         puntaje = _puntaje_fila_encabezado(df_raw.iloc[idx])
         if puntaje > mejor_puntaje:
             mejor_puntaje = puntaje
             mejor_fila = idx
+
     return mejor_fila, df_raw
 
+
+def _columna_es_numerica_importe(df, col):
+    """Verifica si una columna parece contener importes numericos."""
+    if col not in df.columns:
+        return 0
+    col_data = df[col].dropna()
+    if len(col_data) == 0:
+        return 0
+
+    # Intentar convertir a float
+    convertidos = col_data.apply(normalizar_importe)
+    no_cero = (convertidos != 0).sum()
+    return no_cero
+
+
+def _columna_es_fecha(df, col):
+    """Verifica si una columna parece contener fechas."""
+    if col not in df.columns:
+        return 0
+    col_data = df[col].dropna()
+    if len(col_data) == 0:
+        return 0
+
+    convertidos = col_data.apply(normalizar_fecha)
+    validas = convertidos.notna().sum()
+    return validas
+
+
+def _columna_es_texto_largo(df, col):
+    """Verifica si una columna parece contener textos descriptivos."""
+    if col not in df.columns:
+        return 0
+    col_data = df[col].dropna().astype(str)
+    if len(col_data) == 0:
+        return 0
+
+    # Calcular longitud promedio
+    longitudes = col_data.apply(len)
+    return longitudes.mean()
+
+
+def limpiar_dataframe(df):
+    """
+    Limpia un DataFrame despues de leerlo:
+    - Elimina columnas vacias
+    - Elimina filas de metadata
+    - Elimina filas totalmente vacias
+    """
+    if df.empty:
+        return df
+
+    # 1. Eliminar columnas que son completamente vacias
+    df = df.dropna(axis=1, how='all')
+
+    # 2. Eliminar filas totalmente vacias
+    df = df.dropna(how='all')
+
+    # 3. Eliminar filas de metadata
+    filas_validas = []
+    for idx, fila in df.iterrows():
+        if not _es_fila_metadata(fila):
+            filas_validas.append(idx)
+    df = df.loc[filas_validas].reset_index(drop=True)
+
+    return df
+
+
 def leer_archivo(bytes_data, fila_encabezado=None):
+    """Lee un archivo Excel o CSV con limpieza automatica."""
     if fila_encabezado is None:
         fila_encabezado, _ = detectar_fila_encabezado(bytes_data)
-    if _es_excel(bytes_data):
+
+    es_excel = _es_excel(bytes_data)
+
+    if es_excel:
         df = _leer_como_excel(bytes_data, header=fila_encabezado)
     else:
         df = _leer_como_csv(bytes_data, header=fila_encabezado)
-    df.columns = [str(c).strip() if c is not None else f'Col_{i}' for i, c in enumerate(df.columns)]
-    mask = ~df.apply(lambda row: _es_metadata(row), axis=1)
-    df = df[mask].reset_index(drop=True)
-    df = df.dropna(how='all').reset_index(drop=True)
+
+    # Limpiar nombres de columnas
+    df.columns = [str(c).strip() if c is not None else f'Col_{i}'
+                  for i, c in enumerate(df.columns)]
+
+    # Limpiar dataframe
+    df = limpiar_dataframe(df)
+
+    # Segunda pasada: eliminar filas donde cualquier celda coincida con metadata
+    filas_a_mantener = []
+    for idx, fila in df.iterrows():
+        es_meta = False
+        for val in fila:
+            if pd.notna(val):
+                v_str = str(val).strip().lower()
+                if any(re.search(p, v_str) for p in PATRONES_METADATA):
+                    es_meta = True
+                    break
+        if not es_meta:
+            filas_a_mantener.append(idx)
+
+    df = df.loc[filas_a_mantener].reset_index(drop=True)
+
     return df
 
+
 def _puntaje_coincidencia(col_norm, p_norm):
+    """Calcula un puntaje de coincidencia entre nombre de columna y patron."""
     if col_norm == p_norm:
         return 100
     if p_norm in col_norm or col_norm in p_norm:
@@ -185,130 +325,182 @@ def _puntaje_coincidencia(col_norm, p_norm):
         return 20 * len(interseccion)
     return 0
 
+
 def detectar_columna(df, patterns):
+    """Detecta la columna que MEJOR coincide con alguno de los patrones."""
     mejor_col = None
     mejor_puntaje = -1
+
     for col in df.columns:
         if col is None:
             continue
         col_str = str(col).strip()
         col_norm = normalizar_texto(col_str)
+
         for p in patterns:
             p_norm = normalizar_texto(p)
             puntaje = _puntaje_coincidencia(col_norm, p_norm)
             if puntaje > mejor_puntaje:
                 mejor_puntaje = puntaje
                 mejor_col = col_str
+
     return mejor_col if mejor_puntaje >= 20 else None
 
-def detectar_columna_importe_por_contenido(df):
-    mejor_col = None
-    mejor_score = -1
-    for col in df.columns:
-        valores = df[col].dropna().head(50)
-        if len(valores) < 3:
-            continue
-        numericos = 0
-        suma = 0
-        for v in valores:
-            try:
-                val = normalizar_importe(v)
-                if val != 0:
-                    numericos += 1
-                    suma += abs(val)
-            except:
-                pass
-        if numericos >= 3:
-            score = numericos * (1 if 0 < suma < 1e9 else 0.1)
-            if score > mejor_score:
-                mejor_score = score
-                mejor_col = col
-    return mejor_col
 
 def detectar_columnas_recomendadas(df):
-    fecha = detectar_columna(df, PALABRAS_CLAVE_FECHA)
-    importe = detectar_columna(df, PALABRAS_CLAVE_IMPORTE)
-    concepto = detectar_columna(df, PALABRAS_CLAVE_CONCEPTO)
-    cuit = detectar_columna(df, PALABRAS_CLAVE_CUIT)
-    if importe is None:
-        importe = detectar_columna_importe_por_contenido(df)
-    return {
-        'fecha': fecha,
-        'importe': importe,
-        'concepto': concepto,
-        'cuit': cuit,
+    """
+    Detecta todas las columnas recomendadas.
+    Si la deteccion por nombre falla, usa deteccion por contenido.
+    """
+    result = {
+        'fecha': detectar_columna(df, PALABRAS_CLAVE_FECHA),
+        'importe': detectar_columna(df, PALABRAS_CLAVE_IMPORTE),
+        'concepto': detectar_columna(df, PALABRAS_CLAVE_CONCEPTO),
+        'cuit': detectar_columna(df, PALABRAS_CLAVE_CUIT),
     }
 
-def diagnosticar_datos(df, col_fecha, col_importe):
-    resultados = {}
-    if col_fecha and col_fecha in df.columns:
-        fechas = df[col_fecha].apply(normalizar_fecha)
-        validas = fechas.notna().sum()
-        total = len(df)
-        resultados['fecha'] = {
+    # Si no detecto importe por nombre, buscar por contenido numerico
+    if result['importe'] is None or _columna_es_numerica_importe(df, result['importe']) == 0:
+        mejor_col = None
+        mejor_count = 0
+        for col in df.columns:
+            count = _columna_es_numerica_importe(df, col)
+            if count > mejor_count:
+                # No elegir la columna de fecha si ya la detectamos
+                if result['fecha'] and col == result['fecha']:
+                    continue
+                mejor_count = count
+                mejor_col = col
+        if mejor_col and mejor_count > 0:
+            result['importe'] = mejor_col
+
+    # Si no detecto fecha por nombre, buscar por contenido de fecha
+    if result['fecha'] is None or _columna_es_fecha(df, result['fecha']) == 0:
+        mejor_col = None
+        mejor_count = 0
+        for col in df.columns:
+            count = _columna_es_fecha(df, col)
+            if count > mejor_count:
+                mejor_count = count
+                mejor_col = col
+        if mejor_col and mejor_count > 0:
+            result['fecha'] = mejor_col
+
+    # Si no detecto concepto por nombre, buscar texto mas largo
+    if result['concepto'] is None or _columna_es_texto_largo(df, result['concepto']) < 5:
+        mejor_col = None
+        mejor_len = 0
+        for col in df.columns:
+            # No elegir fecha o importe
+            if result['fecha'] and col == result['fecha']:
+                continue
+            if result['importe'] and col == result['importe']:
+                continue
+            avg_len = _columna_es_texto_largo(df, col)
+            if avg_len > mejor_len:
+                mejor_len = avg_len
+                mejor_col = col
+        if mejor_col and mejor_len > 5:
+            result['concepto'] = mejor_col
+
+    return result
+
+
+def diagnosticar_columna(df, col_nombre, tipo='fecha'):
+    """Diagnostica una columna especifica."""
+    if col_nombre is None or col_nombre not in df.columns:
+        return {'error': 'Columna no encontrada'}
+
+    col = df[col_nombre]
+    total = len(col)
+    no_nulos = col.notna().sum()
+
+    if tipo == 'fecha':
+        parseadas = col.apply(normalizar_fecha)
+        validas = parseadas.notna().sum()
+        ejemplos_validos = parseadas.dropna().head(3).tolist()
+        ejemplos_invalidos = col[parseadas.isna() & col.notna()].head(3).tolist()
+        return {
+            'total': total,
+            'no_nulos': int(no_nulos),
             'validas': int(validas),
-            'total': int(total),
-            'porcentaje': round(validas/total*100, 1) if total > 0 else 0,
-            'ejemplos': df[col_fecha].dropna().head(3).tolist()
+            'tasa': round(validas/total*100, 1) if total > 0 else 0,
+            'ejemplos_validos': [str(v) for v in ejemplos_validos],
+            'ejemplos_invalidos': [str(v) for v in ejemplos_invalidos],
         }
-    else:
-        resultados['fecha'] = {'validas': 0, 'total': len(df), 'porcentaje': 0, 'ejemplos': []}
-    if col_importe and col_importe in df.columns:
-        importes = df[col_importe].apply(normalizar_importe)
-        validos = (importes != 0).sum()
-        total = len(df)
-        resultados['importe'] = {
-            'validos': int(validos),
-            'total': int(total),
-            'porcentaje': round(validos/total*100, 1) if total > 0 else 0,
-            'suma': round(importes.sum(), 2),
-            'ejemplos': df[col_importe].dropna().head(3).tolist()
+
+    elif tipo == 'importe':
+        parseados = col.apply(normalizar_importe)
+        no_cero = (parseados != 0).sum()
+        ejemplos = col.head(5).tolist()
+        parseados_ej = parseados.head(5).tolist()
+        return {
+            'total': total,
+            'no_nulos': int(no_nulos),
+            'no_cero': int(no_cero),
+            'tasa': round(no_cero/total*100, 1) if total > 0 else 0,
+            'ejemplos_crudos': [str(v) for v in ejemplos],
+            'ejemplos_parseados': [str(v) for v in parseados_ej],
+            'suma_total': round(parseados.sum(), 2),
         }
-    else:
-        resultados['importe'] = {'validos': 0, 'total': len(df), 'porcentaje': 0, 'suma': 0, 'ejemplos': []}
-    return resultados
+
+    return {}
+
 
 def conciliar(df_banco, df_sistema, col_fecha_banco, col_importe_banco, col_desc_banco,
               col_fecha_sistema, col_importe_sistema, col_desc_sistema,
               col_cuit_banco=None, col_cuit_sistema=None,
               tolerancia_pct=0.0, tolerancia_dias=0, exigir_cuit=False):
+    """Conciliacion 1 a 1 con tolerancias."""
     df_banco = df_banco.copy()
     df_sistema = df_sistema.copy()
+
     df_banco['Fecha_norm'] = df_banco[col_fecha_banco].apply(normalizar_fecha)
     df_banco['Importe_norm'] = df_banco[col_importe_banco].apply(normalizar_importe)
     df_banco['Desc_norm'] = df_banco[col_desc_banco].astype(str).str.upper().str.strip()
+
     df_sistema['Fecha_norm'] = df_sistema[col_fecha_sistema].apply(normalizar_fecha)
     df_sistema['Importe_norm'] = df_sistema[col_importe_sistema].apply(normalizar_importe)
     df_sistema['Desc_norm'] = df_sistema[col_desc_sistema].astype(str).str.upper().str.strip()
+
     if exigir_cuit and col_cuit_banco and col_cuit_sistema:
         df_banco['CUIT_norm'] = df_banco[col_cuit_banco].astype(str).str.replace(r'[-\s]', '', regex=True)
         df_sistema['CUIT_norm'] = df_sistema[col_cuit_sistema].astype(str).str.replace(r'[-\s]', '', regex=True)
+
     resultados = []
     sistema_usados = set()
+
     for idx_b, row_b in df_banco.iterrows():
         fecha_b = row_b['Fecha_norm']
         importe_b = row_b['Importe_norm']
         desc_b = row_b['Desc_norm']
         cuit_b = row_b.get('CUIT_norm', '') if exigir_cuit else ''
+
         mejor_match = None
         mejor_score = -1
+
         for idx_s, row_s in df_sistema.iterrows():
             if idx_s in sistema_usados:
                 continue
+
             fecha_s = row_s['Fecha_norm']
             importe_s = row_s['Importe_norm']
             desc_s = row_s['Desc_norm']
             cuit_s = row_s.get('CUIT_norm', '') if exigir_cuit else ''
+
             if pd.isna(fecha_b) or pd.isna(fecha_s):
                 continue
+
             diff_dias = abs((fecha_b - fecha_s).days)
             if diff_dias > tolerancia_dias:
                 continue
+
             if importe_s == 0:
                 continue
             diff_pct = abs(importe_b - importe_s) / abs(importe_s)
             if diff_pct > tolerancia_pct:
                 continue
+
             score = 0
             if diff_dias == 0: score += 10
             if diff_pct == 0: score += 10
@@ -316,9 +508,11 @@ def conciliar(df_banco, df_sistema, col_fecha_banco, col_importe_banco, col_desc
                 score += 5
             if exigir_cuit and cuit_b and cuit_s and cuit_b == cuit_s:
                 score += 20
+
             if score > mejor_score:
                 mejor_score = score
                 mejor_match = idx_s
+
         if mejor_match is not None:
             sistema_usados.add(mejor_match)
             row_s = df_sistema.loc[mejor_match]
@@ -343,6 +537,7 @@ def conciliar(df_banco, df_sistema, col_fecha_banco, col_importe_banco, col_desc
                 'Estado': 'PENDIENTE',
                 'Dias_Diff': None
             })
+
     for idx_s, row_s in df_sistema.iterrows():
         if idx_s not in sistema_usados:
             resultados.append({
@@ -355,52 +550,70 @@ def conciliar(df_banco, df_sistema, col_fecha_banco, col_importe_banco, col_desc
                 'Estado': 'SIN_MOVIMIENTO_BANCO',
                 'Dias_Diff': None
             })
+
     return pd.DataFrame(resultados)
+
 
 def conciliar_agregado(df_banco, df_sistema, col_fecha_banco, col_importe_banco, col_desc_banco,
                        col_fecha_sistema, col_importe_sistema,
                        tolerancia_pct=0.0, tolerancia_dias=0):
+    """Conciliacion agregada."""
     df_banco = df_banco.copy()
     df_sistema = df_sistema.copy()
+
     df_banco['Fecha_norm'] = df_banco[col_fecha_banco].apply(normalizar_fecha)
     df_banco['Importe_norm'] = df_banco[col_importe_banco].apply(normalizar_importe)
     df_banco['Desc_norm'] = df_banco[col_desc_banco].astype(str).str.upper().str.strip()
+
     df_sistema['Fecha_norm'] = df_sistema[col_fecha_sistema].apply(normalizar_fecha)
     df_sistema['Importe_norm'] = df_sistema[col_importe_sistema].apply(normalizar_importe)
+
     sistema_agrup = df_sistema.groupby(df_sistema['Fecha_norm'].dt.date)['Importe_norm'].sum().reset_index()
     sistema_agrup.columns = ['Fecha', 'Importe_Sistema']
+
     resultados = []
     sistema_usados = set()
+
     for idx_b, row_b in df_banco.iterrows():
         fecha_b = row_b['Fecha_norm']
         importe_b = row_b['Importe_norm']
         desc_b = row_b['Desc_norm']
+
         if pd.isna(fecha_b):
             continue
+
         fecha_b_date = fecha_b.date()
         mejor_match = None
         mejor_score = -1
+
         for idx_s, row_s in sistema_agrup.iterrows():
             if idx_s in sistema_usados:
                 continue
+
             fecha_s = row_s['Fecha']
             importe_s = row_s['Importe_Sistema']
+
             if fecha_s is None or pd.isna(fecha_s):
                 continue
+
             diff_dias = abs((fecha_b_date - fecha_s).days if hasattr(fecha_b_date, 'days') else abs((pd.Timestamp(fecha_b_date) - pd.Timestamp(fecha_s)).days))
             if diff_dias > tolerancia_dias:
                 continue
+
             if importe_s == 0:
                 continue
             diff_pct = abs(importe_b - importe_s) / abs(importe_s)
             if diff_pct > tolerancia_pct:
                 continue
+
             score = 0
             if diff_dias == 0: score += 10
             if diff_pct == 0: score += 10
+
             if score > mejor_score:
                 mejor_score = score
                 mejor_match = idx_s
+
         if mejor_match is not None:
             sistema_usados.add(mejor_match)
             row_s = sistema_agrup.loc[mejor_match]
@@ -425,6 +638,7 @@ def conciliar_agregado(df_banco, df_sistema, col_fecha_banco, col_importe_banco,
                 'Estado': 'PENDIENTE',
                 'Dias_Diff': None
             })
+
     for idx_s, row_s in sistema_agrup.iterrows():
         if idx_s not in sistema_usados:
             resultados.append({
@@ -437,4 +651,5 @@ def conciliar_agregado(df_banco, df_sistema, col_fecha_banco, col_importe_banco,
                 'Estado': 'SIN_MOVIMIENTO_BANCO',
                 'Dias_Diff': None
             })
+
     return pd.DataFrame(resultados)
