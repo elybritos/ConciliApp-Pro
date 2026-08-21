@@ -10,15 +10,50 @@ import plotly.express as px
 from io import BytesIO
 from datetime import datetime
 import os
+import sys
+import importlib.util
 
-from motor_conciliacion import (
-    leer_archivo, detectar_fila_encabezado, detectar_columnas_recomendadas,
-    diagnosticar_columna, conciliar, conciliar_agregado
-)
-from database import (
-    crear_usuario, validar_login, guardar_perfil, listar_perfiles,
-    eliminar_perfil, guardar_conciliacion, obtener_historial
-)
+# ═══════════════════════════════════════════════════════════════════════
+# DIAGNOSTICO + CARGA DIRECTA DE MODULOS (fix para Streamlit Cloud)
+# ═══════════════════════════════════════════════════════════════════════
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+st.write("📁 Archivos en la carpeta:", os.listdir(BASE_DIR))
+
+# Cargar motor_conciliacion.py directamente
+motor_path = os.path.join(BASE_DIR, "motor_conciliacion.py")
+if os.path.exists(motor_path):
+    spec_motor = importlib.util.spec_from_file_location("motor_conciliacion", motor_path)
+    motor = importlib.util.module_from_spec(spec_motor)
+    spec_motor.loader.exec_module(motor)
+    leer_archivo = motor.leer_archivo
+    detectar_fila_encabezado = motor.detectar_fila_encabezado
+    detectar_columnas_recomendadas = motor.detectar_columnas_recomendadas
+    diagnosticar_columna = motor.diagnosticar_columna
+    conciliar = motor.conciliar
+    conciliar_agregado = motor.conciliar_agregado
+    st.write("✅ motor_conciliacion.py cargado correctamente")
+else:
+    st.error(f"❌ No se encuentra motor_conciliacion.py en: {motor_path}")
+    st.stop()
+
+# Cargar database.py directamente
+db_path = os.path.join(BASE_DIR, "database.py")
+if os.path.exists(db_path):
+    spec_db = importlib.util.spec_from_file_location("database", db_path)
+    db = importlib.util.module_from_spec(spec_db)
+    spec_db.loader.exec_module(db)
+    crear_usuario = db.crear_usuario
+    validar_login = db.validar_login
+    guardar_perfil = db.guardar_perfil
+    listar_perfiles = db.listar_perfiles
+    eliminar_perfil = db.eliminar_perfil
+    guardar_conciliacion = db.guardar_conciliacion
+    obtener_historial = db.obtener_historial
+    st.write("✅ database.py cargado correctamente")
+else:
+    st.error(f"❌ No se encuentra database.py en: {db_path}")
+    st.stop()
 
 # ── Estado de sesion ─────────────────────────────────────────────────────
 if "user_id" not in st.session_state:
