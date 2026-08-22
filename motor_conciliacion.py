@@ -1,655 +1,367 @@
 # -*- coding: utf-8 -*-
 """
-motor_conciliacion.py
+database.py
 
-Motor de conciliacion bancaria generico.
-Mejorado para archivos reales con encabezados en cualquier fila,
-columnas vacias, metadata, multiples paginas, etc.
+Capa de base de datos para ConciliApp.
+Usa SQLite localmente. Facilmente migrable a PostgreSQL.
 """
 
-import re
-import io
-import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
+import sqlite3
+import json
+import hashlib
+import os
+from datetime import datetime
+from contextlib import contextmanager
 
-# ── Palabras clave para detectar encabezados ──────────────────────────────
-PALABRAS_CLAVE_FECHA = ['fecha', 'date', 'fch', 'dia', 'periodo', 'vencimiento', 'vto']
-PALABRAS_CLAVE_IMPORTE = ['importe', 'monto', 'debe', 'haber', 'valor', 'amount',
-                         'total', 'neto', 'bruto', 'subtotal', 'credito', 'debito',
-                         'crédito', 'débito', 'saldo']
-PALABRAS_CLAVE_CONCEPTO = ['concepto', 'descripcion', 'detalle', 'desc', 'referencia',
-                          'concept', 'cliente', 'proveedor', 'razon social', 'razón social',
-                          'nombre', 'observacion', 'observación', 'comprobante',
-                          'tipo', 'movimiento', 'transaccion', 'transacción',
-                          'usuario', 'operacion', 'operación', 'sucursal']
-PALABRAS_CLAVE_CUIT = ['cuit', 'cuil', 'dni', 'documento', 'identificacion', 'identificación']
-
-TODAS_PALABRAS_CLAVE = (PALABRAS_CLAVE_FECHA + PALABRAS_CLAVE_IMPORTE +
-                        PALABRAS_CLAVE_CONCEPTO + PALABRAS_CLAVE_CUIT)
-
-# ── Patrones para detectar filas de metadata ─────────────────────────────
-PATRONES_METADATA = [
-    r'^fecha de descarga', r'^empresa:', r'^operador:', r'^filtrado por:',
-    r'^página \d+ de \d+', r'^total:', r'^listado de', r'^hc latinoamerica',
-    r'^desde\s+\d', r'^hasta\s+\d', r'^sucursal:', r'^cobrador:',
-    r'^cliente:', r'^\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2}$',
-]
+DB_PATH = os.path.join(os.path.dirname(__file__), "conciliapp.db")
 
 
-def normalizar_texto(t):
-    if pd.isna(t): return ''
-    t = re.sub(r'[.,]', ' ', str(t))
-    return re.sub(r'\s+', ' ', t).strip().upper()
+def _get_connection():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
-def normalizar_importe(val):
-    """Normaliza un importe a float."""
-    if pd.isna(val): return 0.0
+def init_db():
+    """Inicializa las tablas de la base de datos."""
+    with _get_connection() as conn:
+        cursor = conn.cursor()
 
-    s = str(val).strip()
-    negativo = False
-    if s.startswith('(') and s.endswith(')'):
-        negativo = True
-        s = s[1:-1]
+        # Tabla de usuarios
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS usuarios (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                nombre TEXT,
+                email TEXT,
+                activo INTEGER DEFAULT 1,
+                creado_en TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
-    s = re.sub(r'[$€£\s]', '', s)
+        # Tabla de perfiles
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS perfiles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                usuario_id INTEGER NOT NULL,
+                nombre TEXT NOT NULL,
+                config_json TEXT NOT NULL,
+                creado_en TEXT DEFAULT CURRENT_TIMESTAMP,
+                actualizado_en TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (usuario_id) REFERENCES usuarios(id)
+            )
+        """)
 
-    if not s:
-        return 0.0
+        # Tabla de conciliaciones (historial)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS conciliaciones (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                usuario_id INTEGER NOT NULL,
+                perfil_id INTEGER,
+                nombre_archivo_banco TEXT,
+                nombre_archivo_sistema TEXT,
+                modo TEXT,
+                total_registros INTEGER,
+                conciliados INTEGER,
+                pendientes INTEGER,
+                sin_movimiento INTEGER,
+                total_banco REAL,
+                total_sistema REAL,
+                ejecutada_en TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (usuario_id) REFERENCES usuarios(id),
+                FOREIGN KEY (perfil_id) REFERENCES perfiles(id)
+            )
+        """)
 
-    num_commas = s.count(',')
-    num_dots = s.count('.')
+        # Tabla de pendientes (Paso 5 - arrastrables)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS pendientes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                usuario_id INTEGER NOT NULL,
+                concepto_banco TEXT,
+                importe_banco REAL,
+                fecha TEXT,
+                concepto_sistema TEXT,
+                importe_sistema REAL,
+                estado TEXT DEFAULT 'PENDIENTE',
+                periodo TEXT,
+                creado_en TEXT DEFAULT CURRENT_TIMESTAMP,
+                resuelto_en TEXT,
+                FOREIGN KEY (usuario_id) REFERENCES usuarios(id)
+            )
+        """)
 
-    if num_dots >= 1 and num_commas == 1 and s.rfind(',') > s.rfind('.'):
-        s = s.replace('.', '').replace(',', '.')
-    elif num_commas >= 1 and num_dots == 1 and s.rfind('.') > s.rfind(','):
-        s = s.replace(',', '')
-    elif num_commas == 1 and num_dots == 0:
-        s = s.replace(',', '.')
-    elif num_dots >= 2 and num_commas == 0:
-        s = s.replace('.', '')
+        # Tabla de configuracion de empresa (logo, colores, nombre)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS config_empresa (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                usuario_id INTEGER NOT NULL UNIQUE,
+                nombre_empresa TEXT DEFAULT 'ConciliApp PRO',
+                logo_url TEXT DEFAULT '',
+                color_primario TEXT DEFAULT '#1e40af',
+                color_secundario TEXT DEFAULT '#64748b',
+                color_exito TEXT DEFAULT '#11998e',
+                color_alerta TEXT DEFAULT '#f5576c',
+                modo_oscuro INTEGER DEFAULT 0,
+                alerta_diferencia REAL DEFAULT 100.0,
+                FOREIGN KEY (usuario_id) REFERENCES usuarios(id)
+            )
+        """)
 
+        conn.commit()
+
+        # Crear usuario admin por defecto si no existe
+        cursor.execute("SELECT COUNT(*) FROM usuarios")
+        if cursor.fetchone()[0] == 0:
+            crear_usuario("admin", "admin123", "Administrador", "admin@conciliapp.com")
+            print("✅ Usuario admin creado: admin / admin123")
+
+
+def _hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
+
+
+def crear_usuario(username, password, nombre="", email=""):
+    """Crea un nuevo usuario."""
     try:
-        resultado = float(s)
-        return -resultado if negativo else resultado
-    except:
-        return 0.0
-
-
-def normalizar_fecha(val):
-    """Intenta parsear fechas. Maneja numeros de serie de Excel y texto."""
-    if pd.isna(val): return pd.NaT
-
-    if isinstance(val, (datetime, pd.Timestamp)):
-        return pd.Timestamp(val)
-
-    # Si es un numero (serie de Excel)
-    if isinstance(val, (int, float)) and val > 30000:
-        try:
-            return pd.Timestamp('1899-12-30') + pd.Timedelta(days=int(val))
-        except:
-            pass
-
-    s = str(val).strip()
-    if not s or s.lower() in ['nan', 'nat', 'none', '']:
-        return pd.NaT
-
-    # Intentar como numero en string
-    try:
-        num = float(s)
-        if num > 30000:
-            return pd.Timestamp('1899-12-30') + pd.Timedelta(days=int(num))
-    except:
-        pass
-
-    formatos = [
-        '%d/%m/%Y', '%d-%m-%Y', '%d/%m/%y', '%d-%m-%y',
-        '%Y/%m/%d', '%Y-%m-%d', '%m/%d/%Y',
-        '%d.%m.%Y', '%d.%m.%y',
-    ]
-
-    for fmt in formatos:
-        try:
-            return pd.Timestamp(datetime.strptime(s, fmt))
-        except ValueError:
-            continue
-
-    try:
-        return pd.to_datetime(val, dayfirst=True, errors='coerce')
-    except:
-        return pd.NaT
-
-
-def _es_fila_metadata(fila):
-    """Detecta si una fila es metadata (no datos)."""
-    texto_completo = ' '.join([str(c).strip() for c in fila if pd.notna(c)]).lower()
-    for patron in PATRONES_METADATA:
-        if re.search(patron, texto_completo):
-            return True
-    return False
-
-
-def _es_excel(bytes_data):
-    """Detecta si los bytes corresponden a un archivo Excel."""
-    return bytes_data[:4] == b'PK\x03\x04' or bytes_data[:4] == b'\xd0\xcf\x11\xe0'
-
-
-def _leer_como_excel(bytes_data, header, nrows=None):
-    kwargs = {'header': header}
-    if nrows is not None:
-        kwargs['nrows'] = nrows
-    try:
-        return pd.read_excel(io.BytesIO(bytes_data), **kwargs)
-    except Exception:
-        return pd.read_excel(io.BytesIO(bytes_data), engine='xlrd', **kwargs)
-
-
-def _leer_como_csv(bytes_data, header, nrows=None):
-    kwargs = {'sep': None, 'engine': 'python', 'header': header}
-    if nrows is not None:
-        kwargs['nrows'] = nrows
-
-    for encoding in ['utf-8', 'latin1', 'iso-8859-1', 'cp1252']:
-        try:
-            kwargs['encoding'] = encoding
-            return pd.read_csv(io.BytesIO(bytes_data), **kwargs)
-        except Exception:
-            continue
-    raise ValueError("No se pudo leer el archivo como CSV.")
-
-
-def _puntaje_fila_encabezado(fila):
-    """Calcula un puntaje para una fila candidata a ser encabezado."""
-    puntaje = 0
-    celdas_no_vacias = 0
-    for celda in fila:
-        if pd.isna(celda):
-            continue
-        texto = str(celda).strip()
-        if not texto:
-            continue
-        celdas_no_vacias += 1
-        texto_norm = normalizar_texto(texto)
-        for palabra in TODAS_PALABRAS_CLAVE:
-            if palabra.upper() in texto_norm or texto_norm in palabra.upper():
-                puntaje += 2
-                break
-        if not re.match(r'^[\d.,\/\-\s]+$', texto):
-            puntaje += 0.5
-    if celdas_no_vacias < 2:
-        puntaje = 0
-    return puntaje
-
-
-def detectar_fila_encabezado(bytes_data, max_filas=20):
-    """Detecta la fila de encabezados. Retorna (fila_encabezado, df_raw)."""
-    es_excel = _es_excel(bytes_data)
-
-    if es_excel:
-        df_raw = _leer_como_excel(bytes_data, header=None, nrows=max_filas)
-    else:
-        df_raw = _leer_como_csv(bytes_data, header=None, nrows=max_filas)
-
-    mejor_fila = 0
-    mejor_puntaje = -1
-
-    for idx in range(min(max_filas, len(df_raw))):
-        puntaje = _puntaje_fila_encabezado(df_raw.iloc[idx])
-        if puntaje > mejor_puntaje:
-            mejor_puntaje = puntaje
-            mejor_fila = idx
-
-    return mejor_fila, df_raw
-
-
-def _columna_es_numerica_importe(df, col):
-    """Verifica si una columna parece contener importes numericos."""
-    if col not in df.columns:
-        return 0
-    col_data = df[col].dropna()
-    if len(col_data) == 0:
-        return 0
-
-    # Intentar convertir a float
-    convertidos = col_data.apply(normalizar_importe)
-    no_cero = (convertidos != 0).sum()
-    return no_cero
-
-
-def _columna_es_fecha(df, col):
-    """Verifica si una columna parece contener fechas."""
-    if col not in df.columns:
-        return 0
-    col_data = df[col].dropna()
-    if len(col_data) == 0:
-        return 0
-
-    convertidos = col_data.apply(normalizar_fecha)
-    validas = convertidos.notna().sum()
-    return validas
-
-
-def _columna_es_texto_largo(df, col):
-    """Verifica si una columna parece contener textos descriptivos."""
-    if col not in df.columns:
-        return 0
-    col_data = df[col].dropna().astype(str)
-    if len(col_data) == 0:
-        return 0
-
-    # Calcular longitud promedio
-    longitudes = col_data.apply(len)
-    return longitudes.mean()
-
-
-def limpiar_dataframe(df):
-    """
-    Limpia un DataFrame despues de leerlo:
-    - Elimina columnas vacias
-    - Elimina filas de metadata
-    - Elimina filas totalmente vacias
-    """
-    if df.empty:
-        return df
-
-    # 1. Eliminar columnas que son completamente vacias
-    df = df.dropna(axis=1, how='all')
-
-    # 2. Eliminar filas totalmente vacias
-    df = df.dropna(how='all')
-
-    # 3. Eliminar filas de metadata
-    filas_validas = []
-    for idx, fila in df.iterrows():
-        if not _es_fila_metadata(fila):
-            filas_validas.append(idx)
-    df = df.loc[filas_validas].reset_index(drop=True)
-
-    return df
-
-
-def leer_archivo(bytes_data, fila_encabezado=None):
-    """Lee un archivo Excel o CSV con limpieza automatica."""
-    if fila_encabezado is None:
-        fila_encabezado, _ = detectar_fila_encabezado(bytes_data)
-
-    es_excel = _es_excel(bytes_data)
-
-    if es_excel:
-        df = _leer_como_excel(bytes_data, header=fila_encabezado)
-    else:
-        df = _leer_como_csv(bytes_data, header=fila_encabezado)
-
-    # Limpiar nombres de columnas
-    df.columns = [str(c).strip() if c is not None else f'Col_{i}'
-                  for i, c in enumerate(df.columns)]
-
-    # Limpiar dataframe
-    df = limpiar_dataframe(df)
-
-    # Segunda pasada: eliminar filas donde cualquier celda coincida con metadata
-    filas_a_mantener = []
-    for idx, fila in df.iterrows():
-        es_meta = False
-        for val in fila:
-            if pd.notna(val):
-                v_str = str(val).strip().lower()
-                if any(re.search(p, v_str) for p in PATRONES_METADATA):
-                    es_meta = True
-                    break
-        if not es_meta:
-            filas_a_mantener.append(idx)
-
-    df = df.loc[filas_a_mantener].reset_index(drop=True)
-
-    return df
-
-
-def _puntaje_coincidencia(col_norm, p_norm):
-    """Calcula un puntaje de coincidencia entre nombre de columna y patron."""
-    if col_norm == p_norm:
-        return 100
-    if p_norm in col_norm or col_norm in p_norm:
-        return 50
-    col_compact = col_norm.replace(' ', '').replace('.', '')
-    p_compact = p_norm.replace(' ', '').replace('.', '')
-    if col_compact == p_compact:
-        return 80
-    if p_compact in col_compact or col_compact in p_compact:
-        return 40
-    col_words = set(col_norm.split())
-    p_words = set(p_norm.split())
-    interseccion = col_words & p_words
-    if interseccion:
-        return 20 * len(interseccion)
-    return 0
-
-
-def detectar_columna(df, patterns):
-    """Detecta la columna que MEJOR coincide con alguno de los patrones."""
-    mejor_col = None
-    mejor_puntaje = -1
-
-    for col in df.columns:
-        if col is None:
-            continue
-        col_str = str(col).strip()
-        col_norm = normalizar_texto(col_str)
-
-        for p in patterns:
-            p_norm = normalizar_texto(p)
-            puntaje = _puntaje_coincidencia(col_norm, p_norm)
-            if puntaje > mejor_puntaje:
-                mejor_puntaje = puntaje
-                mejor_col = col_str
-
-    return mejor_col if mejor_puntaje >= 20 else None
-
-
-def detectar_columnas_recomendadas(df):
-    """
-    Detecta todas las columnas recomendadas.
-    Si la deteccion por nombre falla, usa deteccion por contenido.
-    """
-    result = {
-        'fecha': detectar_columna(df, PALABRAS_CLAVE_FECHA),
-        'importe': detectar_columna(df, PALABRAS_CLAVE_IMPORTE),
-        'concepto': detectar_columna(df, PALABRAS_CLAVE_CONCEPTO),
-        'cuit': detectar_columna(df, PALABRAS_CLAVE_CUIT),
-    }
-
-    # Si no detecto importe por nombre, buscar por contenido numerico
-    if result['importe'] is None or _columna_es_numerica_importe(df, result['importe']) == 0:
-        mejor_col = None
-        mejor_count = 0
-        for col in df.columns:
-            count = _columna_es_numerica_importe(df, col)
-            if count > mejor_count:
-                # No elegir la columna de fecha si ya la detectamos
-                if result['fecha'] and col == result['fecha']:
-                    continue
-                mejor_count = count
-                mejor_col = col
-        if mejor_col and mejor_count > 0:
-            result['importe'] = mejor_col
-
-    # Si no detecto fecha por nombre, buscar por contenido de fecha
-    if result['fecha'] is None or _columna_es_fecha(df, result['fecha']) == 0:
-        mejor_col = None
-        mejor_count = 0
-        for col in df.columns:
-            count = _columna_es_fecha(df, col)
-            if count > mejor_count:
-                mejor_count = count
-                mejor_col = col
-        if mejor_col and mejor_count > 0:
-            result['fecha'] = mejor_col
-
-    # Si no detecto concepto por nombre, buscar texto mas largo
-    if result['concepto'] is None or _columna_es_texto_largo(df, result['concepto']) < 5:
-        mejor_col = None
-        mejor_len = 0
-        for col in df.columns:
-            # No elegir fecha o importe
-            if result['fecha'] and col == result['fecha']:
-                continue
-            if result['importe'] and col == result['importe']:
-                continue
-            avg_len = _columna_es_texto_largo(df, col)
-            if avg_len > mejor_len:
-                mejor_len = avg_len
-                mejor_col = col
-        if mejor_col and mejor_len > 5:
-            result['concepto'] = mejor_col
-
-    return result
-
-
-def diagnosticar_columna(df, col_nombre, tipo='fecha'):
-    """Diagnostica una columna especifica."""
-    if col_nombre is None or col_nombre not in df.columns:
-        return {'error': 'Columna no encontrada'}
-
-    col = df[col_nombre]
-    total = len(col)
-    no_nulos = col.notna().sum()
-
-    if tipo == 'fecha':
-        parseadas = col.apply(normalizar_fecha)
-        validas = parseadas.notna().sum()
-        ejemplos_validos = parseadas.dropna().head(3).tolist()
-        ejemplos_invalidos = col[parseadas.isna() & col.notna()].head(3).tolist()
-        return {
-            'total': total,
-            'no_nulos': int(no_nulos),
-            'validas': int(validas),
-            'tasa': round(validas/total*100, 1) if total > 0 else 0,
-            'ejemplos_validos': [str(v) for v in ejemplos_validos],
-            'ejemplos_invalidos': [str(v) for v in ejemplos_invalidos],
-        }
-
-    elif tipo == 'importe':
-        parseados = col.apply(normalizar_importe)
-        no_cero = (parseados != 0).sum()
-        ejemplos = col.head(5).tolist()
-        parseados_ej = parseados.head(5).tolist()
-        return {
-            'total': total,
-            'no_nulos': int(no_nulos),
-            'no_cero': int(no_cero),
-            'tasa': round(no_cero/total*100, 1) if total > 0 else 0,
-            'ejemplos_crudos': [str(v) for v in ejemplos],
-            'ejemplos_parseados': [str(v) for v in parseados_ej],
-            'suma_total': round(parseados.sum(), 2),
-        }
-
-    return {}
-
-
-def conciliar(df_banco, df_sistema, col_fecha_banco, col_importe_banco, col_desc_banco,
-              col_fecha_sistema, col_importe_sistema, col_desc_sistema,
-              col_cuit_banco=None, col_cuit_sistema=None,
-              tolerancia_pct=0.0, tolerancia_dias=0, exigir_cuit=False):
-    """Conciliacion 1 a 1 con tolerancias."""
-    df_banco = df_banco.copy()
-    df_sistema = df_sistema.copy()
-
-    df_banco['Fecha_norm'] = df_banco[col_fecha_banco].apply(normalizar_fecha)
-    df_banco['Importe_norm'] = df_banco[col_importe_banco].apply(normalizar_importe)
-    df_banco['Desc_norm'] = df_banco[col_desc_banco].astype(str).str.upper().str.strip()
-
-    df_sistema['Fecha_norm'] = df_sistema[col_fecha_sistema].apply(normalizar_fecha)
-    df_sistema['Importe_norm'] = df_sistema[col_importe_sistema].apply(normalizar_importe)
-    df_sistema['Desc_norm'] = df_sistema[col_desc_sistema].astype(str).str.upper().str.strip()
-
-    if exigir_cuit and col_cuit_banco and col_cuit_sistema:
-        df_banco['CUIT_norm'] = df_banco[col_cuit_banco].astype(str).str.replace(r'[-\s]', '', regex=True)
-        df_sistema['CUIT_norm'] = df_sistema[col_cuit_sistema].astype(str).str.replace(r'[-\s]', '', regex=True)
-
-    resultados = []
-    sistema_usados = set()
-
-    for idx_b, row_b in df_banco.iterrows():
-        fecha_b = row_b['Fecha_norm']
-        importe_b = row_b['Importe_norm']
-        desc_b = row_b['Desc_norm']
-        cuit_b = row_b.get('CUIT_norm', '') if exigir_cuit else ''
-
-        mejor_match = None
-        mejor_score = -1
-
-        for idx_s, row_s in df_sistema.iterrows():
-            if idx_s in sistema_usados:
-                continue
-
-            fecha_s = row_s['Fecha_norm']
-            importe_s = row_s['Importe_norm']
-            desc_s = row_s['Desc_norm']
-            cuit_s = row_s.get('CUIT_norm', '') if exigir_cuit else ''
-
-            if pd.isna(fecha_b) or pd.isna(fecha_s):
-                continue
-
-            diff_dias = abs((fecha_b - fecha_s).days)
-            if diff_dias > tolerancia_dias:
-                continue
-
-            if importe_s == 0:
-                continue
-            diff_pct = abs(importe_b - importe_s) / abs(importe_s)
-            if diff_pct > tolerancia_pct:
-                continue
-
-            score = 0
-            if diff_dias == 0: score += 10
-            if diff_pct == 0: score += 10
-            if desc_b and desc_s and any(p in desc_s for p in desc_b.split() if len(p) > 3):
-                score += 5
-            if exigir_cuit and cuit_b and cuit_s and cuit_b == cuit_s:
-                score += 20
-
-            if score > mejor_score:
-                mejor_score = score
-                mejor_match = idx_s
-
-        if mejor_match is not None:
-            sistema_usados.add(mejor_match)
-            row_s = df_sistema.loc[mejor_match]
-            resultados.append({
-                'Fecha': fecha_b,
-                'Concepto_Banco': desc_b,
-                'Importe_Banco': importe_b,
-                'Concepto_Sistema': row_s['Desc_norm'],
-                'Importe_Sistema': row_s['Importe_norm'],
-                'Diferencia': abs(importe_b - row_s['Importe_norm']),
-                'Estado': 'CONCILIADO',
-                'Dias_Diff': abs((fecha_b - row_s['Fecha_norm']).days) if pd.notna(fecha_b) and pd.notna(row_s['Fecha_norm']) else None
-            })
+        with _get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO usuarios (username, password_hash, nombre, email) VALUES (?, ?, ?, ?)",
+                (username, _hash_password(password), nombre, email)
+            )
+            uid = cursor.lastrowid
+            # Crear config empresa por defecto
+            cursor.execute(
+                "INSERT INTO config_empresa (usuario_id) VALUES (?)",
+                (uid,)
+            )
+            conn.commit()
+            return True, "Usuario creado exitosamente"
+    except sqlite3.IntegrityError:
+        return False, "El nombre de usuario ya existe"
+
+
+def validar_login(username, password):
+    """Valida credenciales. Retorna (exito, user_id, nombre) o (False, None, None)."""
+    with _get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, password_hash, nombre FROM usuarios WHERE username = ? AND activo = 1",
+            (username,)
+        )
+        row = cursor.fetchone()
+        if row and row["password_hash"] == _hash_password(password):
+            return True, row["id"], row["nombre"]
+        return False, None, None
+
+
+def guardar_perfil(usuario_id, nombre, config_dict):
+    """Guarda o actualiza un perfil."""
+    config_json = json.dumps(config_dict, ensure_ascii=False)
+    with _get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id FROM perfiles WHERE usuario_id = ? AND nombre = ?",
+            (usuario_id, nombre)
+        )
+        existing = cursor.fetchone()
+        if existing:
+            cursor.execute(
+                "UPDATE perfiles SET config_json = ?, actualizado_en = ? WHERE id = ?",
+                (config_json, datetime.now().isoformat(), existing["id"])
+            )
         else:
-            resultados.append({
-                'Fecha': fecha_b,
-                'Concepto_Banco': desc_b,
-                'Importe_Banco': importe_b,
-                'Concepto_Sistema': None,
-                'Importe_Sistema': None,
-                'Diferencia': None,
-                'Estado': 'PENDIENTE',
-                'Dias_Diff': None
-            })
-
-    for idx_s, row_s in df_sistema.iterrows():
-        if idx_s not in sistema_usados:
-            resultados.append({
-                'Fecha': row_s['Fecha_norm'],
-                'Concepto_Banco': None,
-                'Importe_Banco': None,
-                'Concepto_Sistema': row_s['Desc_norm'],
-                'Importe_Sistema': row_s['Importe_norm'],
-                'Diferencia': None,
-                'Estado': 'SIN_MOVIMIENTO_BANCO',
-                'Dias_Diff': None
-            })
-
-    return pd.DataFrame(resultados)
+            cursor.execute(
+                "INSERT INTO perfiles (usuario_id, nombre, config_json) VALUES (?, ?, ?)",
+                (usuario_id, nombre, config_json)
+            )
+        conn.commit()
+        return True
 
 
-def conciliar_agregado(df_banco, df_sistema, col_fecha_banco, col_importe_banco, col_desc_banco,
-                       col_fecha_sistema, col_importe_sistema,
-                       tolerancia_pct=0.0, tolerancia_dias=0):
-    """Conciliacion agregada."""
-    df_banco = df_banco.copy()
-    df_sistema = df_sistema.copy()
+def listar_perfiles(usuario_id):
+    """Lista todos los perfiles de un usuario."""
+    with _get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, nombre, config_json, creado_en, actualizado_en FROM perfiles WHERE usuario_id = ? ORDER BY actualizado_en DESC",
+            (usuario_id,)
+        )
+        rows = cursor.fetchall()
+        return [{
+            "id": r["id"],
+            "nombre": r["nombre"],
+            "config": json.loads(r["config_json"]),
+            "creado_en": r["creado_en"],
+            "actualizado_en": r["actualizado_en"]
+        } for r in rows]
 
-    df_banco['Fecha_norm'] = df_banco[col_fecha_banco].apply(normalizar_fecha)
-    df_banco['Importe_norm'] = df_banco[col_importe_banco].apply(normalizar_importe)
-    df_banco['Desc_norm'] = df_banco[col_desc_banco].astype(str).str.upper().str.strip()
 
-    df_sistema['Fecha_norm'] = df_sistema[col_fecha_sistema].apply(normalizar_fecha)
-    df_sistema['Importe_norm'] = df_sistema[col_importe_sistema].apply(normalizar_importe)
+def eliminar_perfil(usuario_id, perfil_id):
+    """Elimina un perfil."""
+    with _get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "DELETE FROM perfiles WHERE id = ? AND usuario_id = ?",
+            (perfil_id, usuario_id)
+        )
+        conn.commit()
+        return cursor.rowcount > 0
 
-    sistema_agrup = df_sistema.groupby(df_sistema['Fecha_norm'].dt.date)['Importe_norm'].sum().reset_index()
-    sistema_agrup.columns = ['Fecha', 'Importe_Sistema']
 
-    resultados = []
-    sistema_usados = set()
+def guardar_conciliacion(usuario_id, perfil_id, datos):
+    """Guarda el resultado de una conciliacion en el historial."""
+    with _get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO conciliaciones 
+            (usuario_id, perfil_id, nombre_archivo_banco, nombre_archivo_sistema, modo,
+             total_registros, conciliados, pendientes, sin_movimiento, total_banco, total_sistema)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            usuario_id, perfil_id,
+            datos.get("archivo_banco"), datos.get("archivo_sistema"),
+            datos.get("modo"), datos.get("total"), datos.get("conciliados"),
+            datos.get("pendientes"), datos.get("sin_movimiento"),
+            datos.get("total_banco"), datos.get("total_sistema")
+        ))
+        conn.commit()
 
-    for idx_b, row_b in df_banco.iterrows():
-        fecha_b = row_b['Fecha_norm']
-        importe_b = row_b['Importe_norm']
-        desc_b = row_b['Desc_norm']
 
-        if pd.isna(fecha_b):
-            continue
+def obtener_historial(usuario_id, limite=50):
+    """Obtiene el historial de conciliaciones."""
+    with _get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT c.*, p.nombre as perfil_nombre 
+            FROM conciliaciones c
+            LEFT JOIN perfiles p ON c.perfil_id = p.id
+            WHERE c.usuario_id = ?
+            ORDER BY c.ejecutada_en DESC
+            LIMIT ?
+        """, (usuario_id, limite))
+        return [dict(r) for r in cursor.fetchall()]
 
-        fecha_b_date = fecha_b.date()
-        mejor_match = None
-        mejor_score = -1
 
-        for idx_s, row_s in sistema_agrup.iterrows():
-            if idx_s in sistema_usados:
-                continue
+# ═══════════════════════════════════════════════════════════════════════
+# PENDIENTES (PASO 5)
+# ═══════════════════════════════════════════════════════════════════════
 
-            fecha_s = row_s['Fecha']
-            importe_s = row_s['Importe_Sistema']
+def guardar_pendientes(usuario_id, df_pendientes, periodo):
+    """Guarda los pendientes de una conciliacion para arrastrar al siguiente periodo."""
+    with _get_connection() as conn:
+        cursor = conn.cursor()
+        for _, row in df_pendientes.iterrows():
+            cursor.execute("""
+                INSERT INTO pendientes (usuario_id, concepto_banco, importe_banco, fecha,
+                                        concepto_sistema, importe_sistema, estado, periodo)
+                VALUES (?, ?, ?, ?, ?, ?, 'PENDIENTE', ?)
+            """, (
+                usuario_id,
+                str(row.get('Concepto_Banco', '')),
+                float(row.get('Importe_Banco', 0) or 0),
+                str(row.get('Fecha', ''))[:10] if pd.notna(row.get('Fecha')) else None,
+                str(row.get('Concepto_Sistema', '')) if pd.notna(row.get('Concepto_Sistema')) else None,
+                float(row.get('Importe_Sistema', 0) or 0) if pd.notna(row.get('Importe_Sistema')) else None,
+                periodo
+            ))
+        conn.commit()
 
-            if fecha_s is None or pd.isna(fecha_s):
-                continue
 
-            diff_dias = abs((fecha_b_date - fecha_s).days if hasattr(fecha_b_date, 'days') else abs((pd.Timestamp(fecha_b_date) - pd.Timestamp(fecha_s)).days))
-            if diff_dias > tolerancia_dias:
-                continue
+def obtener_pendientes(usuario_id, estado='PENDIENTE'):
+    """Obtiene los pendientes de un usuario."""
+    with _get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM pendientes 
+            WHERE usuario_id = ? AND estado = ?
+            ORDER BY creado_en DESC
+        """, (usuario_id, estado))
+        return [dict(r) for r in cursor.fetchall()]
 
-            if importe_s == 0:
-                continue
-            diff_pct = abs(importe_b - importe_s) / abs(importe_s)
-            if diff_pct > tolerancia_pct:
-                continue
 
-            score = 0
-            if diff_dias == 0: score += 10
-            if diff_pct == 0: score += 10
+def resolver_pendiente(pendiente_id, usuario_id):
+    """Marca un pendiente como resuelto."""
+    with _get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE pendientes SET estado = 'RESUELTO', resuelto_en = ?
+            WHERE id = ? AND usuario_id = ?
+        """, (datetime.now().isoformat(), pendiente_id, usuario_id))
+        conn.commit()
+        return cursor.rowcount > 0
 
-            if score > mejor_score:
-                mejor_score = score
-                mejor_match = idx_s
 
-        if mejor_match is not None:
-            sistema_usados.add(mejor_match)
-            row_s = sistema_agrup.loc[mejor_match]
-            resultados.append({
-                'Fecha': fecha_b,
-                'Concepto_Banco': desc_b,
-                'Importe_Banco': importe_b,
-                'Concepto_Sistema': f'Agregado dia {row_s["Fecha"]}',
-                'Importe_Sistema': row_s['Importe_Sistema'],
-                'Diferencia': abs(importe_b - row_s['Importe_Sistema']),
-                'Estado': 'CONCILIADO (agregado)',
-                'Dias_Diff': abs((pd.Timestamp(fecha_b_date) - pd.Timestamp(row_s['Fecha'])).days)
-            })
-        else:
-            resultados.append({
-                'Fecha': fecha_b,
-                'Concepto_Banco': desc_b,
-                'Importe_Banco': importe_b,
-                'Concepto_Sistema': None,
-                'Importe_Sistema': None,
-                'Diferencia': None,
-                'Estado': 'PENDIENTE',
-                'Dias_Diff': None
-            })
+def contar_pendientes(usuario_id):
+    """Cuenta pendientes activos."""
+    with _get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT COUNT(*) FROM pendientes WHERE usuario_id = ? AND estado = 'PENDIENTE'",
+            (usuario_id,)
+        )
+        return cursor.fetchone()[0]
 
-    for idx_s, row_s in sistema_agrup.iterrows():
-        if idx_s not in sistema_usados:
-            resultados.append({
-                'Fecha': row_s['Fecha'],
-                'Concepto_Banco': None,
-                'Importe_Banco': None,
-                'Concepto_Sistema': f'Agregado dia {row_s["Fecha"]}',
-                'Importe_Sistema': row_s['Importe_Sistema'],
-                'Diferencia': None,
-                'Estado': 'SIN_MOVIMIENTO_BANCO',
-                'Dias_Diff': None
-            })
 
-    return pd.DataFrame(resultados)
+# ═══════════════════════════════════════════════════════════════════════
+# CONFIG EMPRESA (LOGO, COLORES, MODO OSCURO)
+# ═══════════════════════════════════════════════════════════════════════
+
+def obtener_config_empresa(usuario_id):
+    """Obtiene la configuracion de empresa de un usuario."""
+    with _get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM config_empresa WHERE usuario_id = ?",
+            (usuario_id,)
+        )
+        row = cursor.fetchone()
+        if row:
+            return dict(row)
+        # Crear por defecto
+        cursor.execute(
+            "INSERT INTO config_empresa (usuario_id) VALUES (?)",
+            (usuario_id,)
+        )
+        conn.commit()
+        cursor.execute(
+            "SELECT * FROM config_empresa WHERE usuario_id = ?",
+            (usuario_id,)
+        )
+        return dict(cursor.fetchone())
+
+
+def guardar_config_empresa(usuario_id, config):
+    """Guarda la configuracion de empresa."""
+    with _get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE config_empresa SET
+                nombre_empresa = ?,
+                logo_url = ?,
+                color_primario = ?,
+                color_secundario = ?,
+                color_exito = ?,
+                color_alerta = ?,
+                modo_oscuro = ?,
+                alerta_diferencia = ?
+            WHERE usuario_id = ?
+        """, (
+            config.get('nombre_empresa', 'ConciliApp PRO'),
+            config.get('logo_url', ''),
+            config.get('color_primario', '#1e40af'),
+            config.get('color_secundario', '#64748b'),
+            config.get('color_exito', '#11998e'),
+            config.get('color_alerta', '#f5576c'),
+            config.get('modo_oscuro', 0),
+            config.get('alerta_diferencia', 100.0),
+            usuario_id
+        ))
+        conn.commit()
+        return True
+
+
+# Inicializar al importar
+init_db()
