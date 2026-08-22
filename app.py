@@ -818,5 +818,3 @@ elif st.session_state["page"] == "empresa":
     """)
 
 st.markdown(f'<div class="footer">{emp_cfg.get("nombre_empresa", "ConciliApp PRO")} © 2026 — Multi-usuario con perfiles persistentes</div>', unsafe_allow_html=True)
-
-
