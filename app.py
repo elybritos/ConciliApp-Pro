@@ -18,7 +18,7 @@ import importlib.util
 # ═══════════════════════════════════════════════════════════════════════
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-st.write("📁 Archivos en la carpeta:", os.listdir(BASE_DIR))
+
 
 # Cargar motor_conciliacion.py directamente
 motor_path = os.path.join(BASE_DIR, "motor_conciliacion.py")
@@ -32,7 +32,7 @@ if os.path.exists(motor_path):
     diagnosticar_columna = motor.diagnosticar_columna
     conciliar = motor.conciliar
     conciliar_agregado = motor.conciliar_agregado
-    st.write("✅ motor_conciliacion.py cargado correctamente")
+   
 else:
     st.error(f"❌ No se encuentra motor_conciliacion.py en: {motor_path}")
     st.stop()
@@ -50,7 +50,7 @@ if os.path.exists(db_path):
     eliminar_perfil = db.eliminar_perfil
     guardar_conciliacion = db.guardar_conciliacion
     obtener_historial = db.obtener_historial
-    st.write("✅ database.py cargado correctamente")
+
 else:
     st.error(f"❌ No se encuentra database.py en: {db_path}")
     st.stop()
